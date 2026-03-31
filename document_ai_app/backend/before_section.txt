@@ -1,0 +1,730 @@
+"""
+OCR Service with AI Agent Integration
+"""
+import logging
+import asyncio
+import time
+import uuid
+import io
+from typing import List, Dict, Any, Optional
+
+# OCR imports
+try:
+    import pytesseract
+    from PIL import Image
+    TESSERACT_AVAILABLE = True
+except ImportError:
+    TESSERACT_AVAILABLE = False
+
+try:
+    from paddleocr import PaddleOCR
+    PADDLEOCR_AVAILABLE = True
+except ImportError:
+    PADDLEOCR_AVAILABLE = False
+
+try:
+    from landingai import LandingAIADE
+    LANDINGAI_AVAILABLE = True
+except ImportError:
+    LANDINGAI_AVAILABLE = False
+
+try:
+    from docling.document_converter import DocumentConverter
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+    DOCLING_AVAILABLE = True
+except ImportError:
+    DOCLING_AVAILABLE = False
+
+# Image processing
+try:
+    import fitz  # PyMuPDF
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PYPDF_AVAILABLE = False
+
+from core.config import settings
+from models.document import OCREngine, ExtractedChunk, ProcessingResult, DocumentType
+from services.ai_agent_service import ai_agent_service
+
+logger = logging.getLogger(__name__)
+
+
+# Helper functions for image and PDF processing
+def convert_pdf_to_images(file_path: str) -> list:
+    """Convert PDF to list of images"""
+    if not PYPDF_AVAILABLE:
+        raise ImportError("PyMuPDF is required for PDF processing")
+    
+    doc = fitz.open(file_path)
+    images = []
+    
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        pix = page.get_pixmap()
+        img_data = pix.tobytes("png")
+        image = Image.open(io.BytesIO(img_data))
+        images.append(image)
+    
+    doc.close()
+    return images
+
+
+def preprocess_image(file_path: str) -> Image.Image:
+    """Preprocess image for OCR"""
+    if not TESSERACT_AVAILABLE:
+        raise ImportError("PIL is required for image processing")
+    
+    image = Image.open(file_path)
+    
+    # Convert to RGB if necessary
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+    
+    return image
+
+
+class OCRService:
+    """OCR processing service with multiple engine support"""
+    
+    def __init__(self):
+        self.paddle_ocr = None
+        self.landingai_client = None
+        self.docling_converter = None
+        self._init_engines()
+    
+    def _init_engines(self):
+        """Initialize OCR engines"""
+        try:
+            # Initialize PaddleOCR with enhanced configuration
+            if PADDLEOCR_AVAILABLE:
+                self.paddle_ocr = PaddleOCR(
+                    use_angle_cls=True, 
+                    lang='en',
+                    # Enhanced configuration for better extraction
+                    show_log=False,
+                    use_gpu=False,  # Set to True if GPU available
+                    det_db_thresh=0.3,  # Lower threshold for better detection
+                    det_db_box_thresh=0.5,
+                    rec_batch_num=6,
+                    drop_score=0.5,  # Keep more text candidates
+                    # Table detection enhancement
+                    use_table_enhance=True,
+                    table_max_len=488,
+                    table_max_bbox=1
+                )
+                logger.info("PaddleOCR initialized successfully with enhanced configuration")
+            else:
+                logger.warning("PaddleOCR not available, install paddleocr")
+                self.paddle_ocr = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize PaddleOCR: {e}")
+            self.paddle_ocr = None
+        
+        try:
+            # Initialize LandingAI ADE with enhanced configuration for PDFs
+            if LANDINGAI_AVAILABLE and settings.VISION_AGENT_API_KEY:
+                self.landingai_client = LandingAIADE(
+                    apikey=settings.VISION_AGENT_API_KEY,
+                    # Enhanced configuration for better PDF extraction
+                    enable_ocr=True,
+                    enable_table_extraction=True,
+                    enable_form_extraction=True,
+                    enable_layout_analysis=True,
+                    # Fine-tuned parameters for PDF document processing
+                    ocr_confidence_threshold=0.6,  # Lower for better coverage
+                    table_detection_sensitivity=0.9,  # Higher for better table detection
+                    form_field_sensitivity=0.8,  # Higher for better form detection
+                    # PDF-specific optimizations
+                    pdf_image_resolution=300,  # Higher resolution for better OCR
+                    pdf_preprocessing=True,  # Enable PDF preprocessing
+                    multi_column_detection=True,  # Detect multi-column layouts
+                    # Enhanced text extraction
+                    preserve_formatting=True,
+                    detect_handwriting=False,  # Focus on printed text
+                    language_detection=True,  # Auto-detect language
+                    # Advanced features for complex PDFs
+                    enable_document_classification=True,
+                    enable_entity_extraction=True,
+                    enable_key_value_extraction=True
+                )
+                logger.info("LandingAI ADE initialized successfully with enhanced PDF configuration")
+            else:
+                if not LANDINGAI_AVAILABLE:
+                    logger.warning("LandingAI not available, install landingai-ade")
+                else:
+                    logger.warning("VISION_AGENT_API_KEY not found, LandingAI ADE disabled")
+                self.landingai_client = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize LandingAI ADE: {e}")
+            self.landingai_client = None
+        
+        try:
+            # Initialize Docling
+            if DOCLING_AVAILABLE:
+                pipeline_options = PdfPipelineOptions()
+                pipeline_options.do_ocr = True
+                pipeline_options.do_table_structure = True
+                
+                self.docling_converter = DocumentConverter(
+                    format_options={
+                        InputFormat.PDF: pipeline_options,
+                    }
+                )
+                logger.info("Docling initialized successfully with enhanced configuration")
+            else:
+                logger.warning("Docling not available, install docling")
+                self.docling_converter = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize Docling: {e}")
+            self.docling_converter = None
+    
+    async def process_document(
+        self, 
+        file_path: str, 
+        ocr_engine: OCREngine = OCREngine.TESSERACT,
+        extract_tables: bool = True,
+        extract_figures: bool = True,
+        extract_forms: bool = True,
+        enable_ai_analysis: bool = True
+    ) -> ProcessingResult:
+        """
+        Process document with specified OCR engine
+        
+        Args:
+            file_path: Path to document file
+            ocr_engine: OCR engine to use
+            extract_tables: Whether to extract tables
+            extract_figures: Whether to extract figures
+            
+        Returns:
+            ProcessingResult with extracted data and AI insights
+        """
+        start_time = time.time()
+        document_id = str(uuid.uuid4())
+        
+        try:
+            logger.info(f"Processing document {document_id} with {ocr_engine}")
+            
+            # Route to appropriate OCR engine
+            if ocr_engine == OCREngine.TESSERACT:
+                result = await self._process_with_tesseract(file_path, document_id, document_type, file_size, start_time)
+            elif ocr_engine == OCREngine.PADDLEOCR:
+                result = await self._process_with_paddleocr(file_path, document_id, document_type, file_size, start_time)
+            elif ocr_engine == OCREngine.LANDINGAI:
+                result = await self._process_with_landingai(file_path, document_id, document_type, file_size, start_time, extract_tables, extract_figures, extract_forms)
+            elif ocr_engine == OCREngine.DOCLING:
+                result = await self._process_with_docling(file_path, document_id, document_type, file_size, start_time)
+            else:
+                raise ValueError(f"Unsupported OCR engine: {ocr_engine}")
+            
+            # Perform AI analysis if enabled
+            ai_analysis = None
+            logger.info(f"AI analysis enabled: {enable_ai_analysis}")
+            
+            if enable_ai_analysis and result.success:
+                try:
+                    # Extract text content for AI analysis
+                    text_content = self._extract_text_from_chunks(result.chunks)
+                    logger.info(f"Extracted text content length: {len(text_content)}")
+                    
+                    # Perform AI analysis
+                    ai_analysis = await ai_agent_service.analyze_document_intelligently(
+                        ocr_result=result.model_dump(),
+                        document_content=text_content
+                    )
+                    
+                    logger.info(f"AI analysis completed successfully")
+                    
+                    # Update result with AI analysis
+                    result.ai_analysis = ai_analysis.model_dump()
+                    
+                except Exception as e:
+                    logger.error(f"Error during AI analysis: {e}")
+                    result.ai_analysis = None
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing document: {e}")
+            return ProcessingResult(
+                document_id=document_id,
+                ocr_engine=ocr_engine.value,
+                processing_time=time.time() - start_time,
+                chunks=[],
+                success=False,
+                error=str(e)
+            )
+    
+    def _extract_text_content(self, chunks: list) -> str:
+        """Extract text content from chunks"""
+        text_parts = []
+        for chunk in chunks:
+            if chunk.text:
+                text_parts.append(chunk.text)
+        return " ".join(text_parts)
+    
+    async def _process_with_tesseract(
+        self, file_path: str, document_id: str
+    ) -> list:
+        """Process document with Tesseract OCR"""
+        images = []
+        
+        # Determine document type
+        from pathlib import Path
+        file_ext = Path(file_path).suffix.lower()
+        
+        if file_ext == '.pdf':
+            images = convert_pdf_to_images(file_path)
+        else:
+            images = [preprocess_image(file_path)]
+        
+        all_text = []
+        chunks = []
+        
+        for page_num, image in enumerate(images):
+            # Extract text
+            text = pytesseract.image_to_string(image)
+            all_text.append(text)
+            
+            # Create simple chunk
+            chunk = ExtractedChunk(
+                chunk_id=f"{document_id}_page_{page_num}",
+                chunk_type=ChunkType.TEXT,
+                text=text.strip(),
+                page=page_num,
+                confidence=0.8  # Tesseract doesn't provide confidence easily
+            )
+            chunks.append(chunk)
+        
+        processing_time = time.time() - start_time
+        
+        return ProcessingResult(
+            document_id=document_id,
+            ocr_engine=OCREngine.TESSERACT,
+            processing_time=processing_time,
+            success=True,
+            markdown="\n\n".join(all_text),
+            raw_text="\n".join(all_text),
+            chunks=chunks,
+            document_type=document_type,
+            file_size=file_size
+        )
+    
+    async def _process_with_paddleocr(
+        self, file_path: str, document_id: str,
+        document_type: DocumentType, file_size: int, start_time: float
+    ) -> ProcessingResult:
+        """Process document with PaddleOCR"""
+        if not self.paddle_ocr:
+            logger.error("PaddleOCR not initialized")
+            return ProcessingResult(
+                document_id=document_id,
+                ocr_engine=OCREngine.PADDLEOCR.value,
+                processing_time=time.time() - start_time,
+                success=False,
+                error="PaddleOCR not available or not initialized",
+                document_type=document_type,
+                file_size=file_size
+            )
+        
+        # Convert PDF to images or process single image
+        images = []
+        if document_type == DocumentType.PDF:
+            if PYPDF_AVAILABLE:
+                images = convert_pdf_to_images(file_path)
+            else:
+                logger.error("PyMuPDF not available for PDF processing")
+                return ProcessingResult(
+                    document_id=document_id,
+                    ocr_engine=OCREngine.PADDLEOCR.value,
+                    processing_time=time.time() - start_time,
+                    chunks=[],
+                    success=False,
+                    error="PyMuPDF not available for PDF processing",
+                    document_type=document_type,
+                    file_size=file_size
+                )
+        else:
+            if TESSERACT_AVAILABLE:
+                images = [preprocess_image(file_path)]
+            else:
+                logger.error("PIL not available for image processing")
+                return ProcessingResult(
+                    document_id=document_id,
+                    ocr_engine=OCREngine.PADDLEOCR.value,
+                    processing_time=time.time() - start_time,
+                    success=False,
+                    error="Image processing libraries not available",
+                    document_type=document_type,
+                    file_size=file_size
+                )
+        
+        all_text = []
+        chunks = []
+        
+        try:
+            for page_num, image in enumerate(images):
+                # Extract text with PaddleOCR
+                result = self.paddle_ocr.ocr(str(image), cls=True)
+                
+                if result and len(result) > 0:
+                    page_text = []
+                    for line in result:
+                        if line and len(line) > 0:
+                            for word_info in line:
+                                if word_info and len(word_info) >= 2:
+                                    text = word_info[1][0]
+                                    bbox_coords = word_info[0]
+                                    
+                                    if text.strip():
+                                        page_text.append(text)
+                                        
+                                        # Create chunk
+                                        chunk = ExtractedChunk(
+                                            chunk_id=f"{document_id}_paddle_{page_num}_{len(chunks)}",
+                                            chunk_type=ChunkType.TEXT,
+                                            text=text.strip(),
+                                            page=page_num + 1,
+                                            confidence=0.8,  # PaddleOCR doesn't provide confidence easily
+                                            bbox=BoundingBox(
+                                                x1=bbox_coords[0][0],
+                                                y1=bbox_coords[0][1],
+                                                x2=bbox_coords[2][0],
+                                                y2=bbox_coords[2][1]
+                                            ) if len(bbox_coords) == 4 else None
+                                        )
+                                        chunks.append(chunk)
+                    
+                    all_text.extend(page_text)
+            
+            processing_time = time.time() - start_time
+            
+            return ProcessingResult(
+                document_id=document_id,
+                ocr_engine=OCREngine.PADDLEOCR.value,
+                processing_time=processing_time,
+                chunks=chunks,
+                success=True,
+                markdown=" ".join(all_text),
+                raw_text=" ".join(all_text),
+                document_type=document_type,
+                page_count=len(images),
+                file_size=file_size
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing with PaddleOCR: {e}")
+            return ProcessingResult(
+                document_id=document_id,
+                ocr_engine=OCREngine.PADDLEOCR.value,
+                processing_time=time.time() - start_time,
+                chunks=[],
+                success=False,
+                error=f"PaddleOCR processing error: {str(e)}",
+                document_type=document_type,
+                file_size=file_size
+            )
+    
+    async def _process_with_landingai(
+        self, file_path: str, document_id: str,
+        document_type: DocumentType, file_size: int, start_time: float,
+        extract_tables: bool, extract_figures: bool, extract_forms: bool
+    ) -> ProcessingResult:
+        """Process document with LandingAI ADE"""
+        if not self.landingai_client:
+            return ProcessingResult(
+                document_id=document_id,
+                ocr_engine=OCREngine.LANDINGAI.value,
+                processing_time=time.time() - start_time,
+                success=False,
+                error="LandingAI ADE not initialized",
+                document_type=document_type,
+                file_size=file_size
+            )
+        
+        try:
+            # Enhanced PDF processing for better extraction (inspired by L8 notebook)
+            if document_type == DocumentType.PDF:
+                # Convert PDF to high-quality images for better OCR
+                images = convert_pdf_to_images(file_path)
+                if not images:
+                    logger.error("Failed to convert PDF to images")
+                    return ProcessingResult(
+                        document_id=document_id,
+                        ocr_engine=OCREngine.LANDINGAI.value,
+                        processing_time=time.time() - start_time,
+                        chunks=[],
+                        success=False,
+                        error="Failed to convert PDF to images",
+                        document_type=document_type,
+                        file_size=file_size
+                    )
+                
+                all_chunks = []
+                all_text = []
+                total_pages = len(images)
+                
+                # Process each page with enhanced preprocessing
+                for page_num, image in enumerate(images):
+                    try:
+                        # Preprocess image for better OCR
+                        processed_image = preprocess_image(image)
+                        
+                        # Use DPT-2 model for better parsing (from L8 notebook)
+                        logger.info(f"Processing page {page_num + 1}/{total_pages} with DPT-2 model")
+                        response = self.landingai_client.parse(
+                            document=processed_image,
+                            model="dpt-2-latest"  # Use the latest DPT-2 model
+                        )
+                        
+                        # Extract chunks from this page
+                        page_chunks = self._extract_chunks_from_landingai_response(
+                            response, document_id, page_num + 1
+                        )
+                        all_chunks.extend(page_chunks)
+                        
+                        # Collect text from markdown (better than raw text)
+                        if hasattr(response, 'markdown'):
+                            # Clean markdown content
+                            markdown_text = response.markdown
+                            # Remove chunk ID references for cleaner text
+                            import re
+                            markdown_text = re.sub(r'<a id=[\'"][^\'"]*[\'"]></a>', '', markdown_text)
+                            markdown_text = re.sub(r'::<[^>]*::>', '', markdown_text)
+                            all_text.append(markdown_text)
+                        else:
+                            # Fallback to chunk text
+                            for chunk in page_chunks:
+                                all_text.append(chunk.text)
+                        
+                        logger.info(f"Page {page_num + 1} processed: {len(page_chunks)} chunks extracted")
+                            
+                    except Exception as e:
+                        logger.warning(f"Error processing page {page_num + 1} with LandingAI: {e}")
+                        continue
+                
+                chunks = all_chunks
+                markdown = "\n\n".join(all_text)
+                
+            else:
+                # Process non-PDF files with DPT-2 model
+                logger.info("Processing non-PDF document with DPT-2 model")
+                with open(file_path, 'rb') as f:
+                    response = self.landingai_client.parse(
+                        document=f.read(),
+                        model="dpt-2-latest"  # Use the latest DPT-2 model
+                    )
+                
+                # Extract chunks from response
+                chunks = self._extract_chunks_from_landingai_response(response, document_id, 1)
+                
+                # Get markdown content
+                markdown = getattr(response, 'markdown', '')
+                if markdown:
+                    # Clean markdown content
+                    import re
+                    markdown = re.sub(r'<a id=[\'"][^\'"]*[\'"]></a>', '', markdown)
+                    markdown = re.sub(r'::<[^>]*::>', '', markdown)
+            
+            processing_time = time.time() - start_time
+            
+            # Enhanced result with metadata
+            result = ProcessingResult(
+                document_id=document_id,
+                ocr_engine=OCREngine.LANDINGAI.value,
+                processing_time=processing_time,
+                success=True,
+                markdown=markdown,
+                raw_text=markdown,
+                chunks=chunks,
+                document_type=document_type,
+                page_count=len(convert_pdf_to_images(file_path)) if document_type == DocumentType.PDF else 1,
+                file_size=file_size,
+                model_version="dpt-2-latest"  # Track model version
+            )
+            
+            # Add enhanced metadata if available
+            if hasattr(response, 'metadata'):
+                result.metadata = {
+                    "job_id": getattr(response.metadata, 'job_id', None),
+                    "duration_ms": getattr(response.metadata, 'duration_ms', None),
+                    "total_chunks": len(chunks),
+                    "model": "dpt-2-latest"
+                }
+            
+            logger.info(f"LandingAI processing completed: {len(chunks)} chunks, {processing_time:.2f}s")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error processing with LandingAI: {e}")
+            return ProcessingResult(
+                document_id=document_id,
+                ocr_engine=OCREngine.LANDINGAI.value,
+                processing_time=time.time() - start_time,
+                chunks=[],
+                success=False,
+                error=f"LandingAI processing error: {str(e)}",
+                document_type=document_type,
+                file_size=file_size
+            )
+    
+    def _extract_chunks_from_landingai_response(self, response, document_id: str, page_num: int) -> List[ExtractedChunk]:
+        """Extract chunks from LandingAI response with enhanced processing"""
+        chunks = []
+        
+        if hasattr(response, 'chunks') and response.chunks:
+            for chunk_data in response.chunks:
+                # Enhanced chunk type mapping from L8 notebook
+                chunk_type_mapping = {
+                    'chunkText': ChunkType.TEXT,
+                    'chunkTable': ChunkType.TABLE,
+                    'chunkFigure': ChunkType.FIGURE,
+                    'chunkLogo': ChunkType.LOGO,
+                    'chunkForm': ChunkType.FORM,
+                    'chunkMarginalia': ChunkType.MARGINALIA,
+                    'chunkScanCode': ChunkType.SCAN_CODE,
+                    'chunkAttestation': ChunkType.ATTESTATION,
+                    'chunkCard': ChunkType.CARD,
+                    # Additional types from L8 notebook
+                    'text': ChunkType.TEXT,
+                    'table': ChunkType.TABLE,
+                    'figure': ChunkType.FIGURE,
+                    'logo': ChunkType.LOGO,
+                    'form': ChunkType.FORM,
+                    'marginalia': ChunkType.MARGINALIA,
+                    'scan_code': ChunkType.SCAN_CODE,
+                    'attestation': ChunkType.ATTESTATION,
+                    'card': ChunkType.CARD
+                }
+                
+                # Get chunk type with fallback
+                chunk_type_str = getattr(chunk_data, 'type', getattr(chunk_data, 'chunk_type', 'text'))
+                chunk_type = chunk_type_mapping.get(chunk_type_str, ChunkType.TEXT)
+                
+                # Enhanced bounding box conversion
+                bbox = None
+                if hasattr(chunk_data, 'grounding') and hasattr(chunk_data.grounding, 'box'):
+                    box = chunk_data.grounding.box
+                    if hasattr(box, 'bottom') and hasattr(box, 'left') and hasattr(box, 'right') and hasattr(box, 'top'):
+                        bbox = BoundingBox(
+                            x1=float(box.left),
+                            y1=float(box.top), 
+                            x2=float(box.right),
+                            y2=float(box.bottom)
+                        )
+                elif hasattr(chunk_data, 'bbox') and chunk_data.bbox:
+                    if len(chunk_data.bbox) == 4:
+                        bbox = BoundingBox(
+                            x0=float(chunk_data.bbox[0]),
+                            y0=float(chunk_data.bbox[1]),
+                            x1=float(chunk_data.bbox[2]),
+                            y1=float(chunk_data.bbox[3])
+                        )
+                
+                # Enhanced text extraction with markdown processing
+                text = getattr(chunk_data, 'text', '')
+                markdown_content = getattr(chunk_data, 'markdown', '')
+                
+                # Use markdown if available, otherwise use text
+                content = markdown_content if markdown_content else text
+                
+                # Clean up content (remove special markdown tags)
+                if content:
+                    # Remove chunk ID references
+                    import re
+                    content = re.sub(r'<a id=[\'"][^\'"]*[\'"]></a>', '', content)
+                    # Remove special tags like ::logo::, ::figure:: etc.
+                    content = re.sub(r'::<[^>]*::>', '', content)
+                    # Clean up extra whitespace
+                    content = re.sub(r'\n\s*\n', '\n', content).strip()
+                
+                # Get page number from grounding or default to provided page_num
+                chunk_page = page_num
+                if hasattr(chunk_data, 'grounding') and hasattr(chunk_data.grounding, 'page'):
+                    chunk_page = chunk_data.grounding.page + 1  # Convert to 1-based indexing
+                
+                # Get confidence score
+                confidence = getattr(chunk_data, 'confidence', None)
+                if confidence is None and hasattr(chunk_data, 'score'):
+                    confidence = chunk_data.score
+                
+                chunk = ExtractedChunk(
+                    chunk_id=getattr(chunk_data, 'id', f"{document_id}_{len(chunks)}"),
+                    chunk_type=chunk_type,
+                    text=content,
+                    bbox=bbox,
+                    page=chunk_page,
+                    confidence=confidence
+                )
+                chunks.append(chunk)
+        
+        return chunks
+    
+    async def _process_with_docling(
+        self, file_path: str, document_id: str,
+        document_type: DocumentType, file_size: int, start_time: float
+    ) -> ProcessingResult:
+            chunks = []
+            all_text = []
+            
+            # Extract text from Docling result
+            if result and hasattr(result, 'pages'):
+                for page_num, page in enumerate(result.pages):
+                    # Extract text blocks
+                    if hasattr(page, 'texts') and page.texts:
+                        for text_block in page.texts:
+                            if hasattr(text_block, 'text') and text_block.text.strip():
+                                chunk = ExtractedChunk(
+                                    chunk_id=f"{document_id}_docling_{page_num}_{len(chunks)}",
+                                    chunk_type=ChunkType.TEXT,
+                                    text=text_block.text.strip(),
+                                    page=page_num + 1,
+                                    confidence=0.9,  # Docling typically has high confidence
+                                    bbox=BoundingBox(
+                                        x1=getattr(text_block, 'x', 0),
+                                        y1=getattr(text_block, 'y', 0),
+                                        x2=getattr(text_block, 'x', 0) + getattr(text_block, 'width', 100),
+                                        y2=getattr(text_block, 'y', 0) + getattr(text_block, 'height', 20)
+                                    )
+                                )
+                                chunks.append(chunk)
+                                all_text.append(text_block.text.strip())
+                    
+                    # Extract tables
+                    if hasattr(page, 'tables') and page.tables:
+                        for table_idx, table in enumerate(page.tables):
+                            table_text = self._extract_table_text(table)
+                            if table_text.strip():
+                                chunk = ExtractedChunk(
+                                    chunk_id=f"{document_id}_docling_table_{page_num}_{table_idx}",
+                                    chunk_type=ChunkType.TABLE,
+                                    text=table_text,
+                                    page=page_num + 1,
+                                    confidence=0.85,
+                                    bbox=BoundingBox(
+                                        x1=getattr(table, 'x', 0),
+                                        y1=getattr(table, 'y', 0),
+                                        x2=getattr(table, 'x', 0) + getattr(table, 'width', 200),
+                                        y2=getattr(table, 'y', 0) + getattr(table, 'height', 100)
+                                    )
+                                )
+                                chunks.append(chunk)
+                                all_text.append(table_text)
+            
+            processing_time = time.time() - start_time
+            
+            return ProcessingResult(
+                document_id=document_id,
+                ocr_engine=OCREngine.DOCLING.value,
+                processing_time=processing_time,
+                chunks=chunks,
+                success=True,
+                markdown=" ".join(all_text),
+                raw_text=" ".join(all_text),
+                document_type=document_type,
+                page_count=len(result.pages) if result and hasattr(result, 'pages') else 1,
+                file_size=file_size
+            )
+            

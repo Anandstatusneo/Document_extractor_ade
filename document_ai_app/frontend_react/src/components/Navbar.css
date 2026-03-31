@@ -1,0 +1,136 @@
+.navbar {
+    background: var(--navy);
+    box-shadow: 0 2px 12px rgba(26, 34, 54, .18);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+}
+
+.navbar-inner {
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 0 24px;
+    height: 64px;
+    display: flex;
+    align-items: center;
+    gap: 32px;
+}
+
+.navbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    text-decoration: none;
+    flex-shrink: 0;
+}
+
+.navbar-logo {
+    width: 40px;
+    height: 40px;
+    background: var(--gold);
+    border-radius: var(--r-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.25rem;
+    box-shadow: 0 2px 8px rgba(245, 197, 24, .4);
+    transition: transform var(--t-fast);
+}
+
+.navbar-brand:hover .navbar-logo {
+    transform: scale(1.08);
+}
+
+.navbar-title {
+    display: flex;
+    flex-direction: column;
+}
+
+.brand-name {
+    font-size: 1.0625rem;
+    font-weight: 700;
+    color: var(--white);
+    letter-spacing: -.01em;
+    line-height: 1.2;
+}
+
+.brand-tagline {
+    font-size: .7rem;
+    color: rgba(255, 255, 255, .45);
+    font-weight: 400;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+}
+
+.navbar-links {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+}
+
+.nav-link {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 16px;
+    border-radius: var(--r-sm);
+    color: rgba(255, 255, 255, .6);
+    font-size: .875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background var(--t-fast), color var(--t-fast);
+    text-decoration: none;
+}
+
+.nav-link:hover {
+    background: rgba(255, 255, 255, .08);
+    color: var(--white);
+}
+
+.nav-link.active {
+    background: rgba(245, 197, 24, .15);
+    color: var(--gold);
+}
+
+.navbar-actions {
+    margin-left: auto;
+}
+
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 14px;
+    background: rgba(255, 255, 255, .06);
+    border: 1px solid rgba(255, 255, 255, .1);
+    border-radius: var(--r-full);
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #48BB78;
+    box-shadow: 0 0 0 3px rgba(72, 187, 120, .25);
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+
+    0%,
+    100% {
+        box-shadow: 0 0 0 3px rgba(72, 187, 120, .25);
+    }
+
+    50% {
+        box-shadow: 0 0 0 5px rgba(72, 187, 120, .1);
+    }
+}
+
+.status-text {
+    font-size: .78rem;
+    color: rgba(255, 255, 255, .55);
+    font-weight: 500;
+}
